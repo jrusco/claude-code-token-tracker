@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+#
+# token-tracker - Claude Code Live Token Tracker
+#
+# A lightweight terminal utility that monitors Claude Code token consumption
+# in real-time, displaying an ASCII dashboard.
+#
+# Usage: token-tracker [OPTIONS]
+# Run 'token-tracker --help' for full usage information.
+#
+# Copyright (c) 2026
+# Licensed under MIT License
+#
+
+set -euo pipefail
+
+# ------------------------------------------------------------------------------
+# Script Location
+# ------------------------------------------------------------------------------
+
+# Resolve script directory (handles symlinks)
+get_script_dir() {
+    local source="${BASH_SOURCE[0]}"
+    while [[ -L "$source" ]]; do
+        local dir
+        dir=$(cd -P "$(dirname "$source")" && pwd)
+        source=$(readlink "$source")
+        [[ "$source" != /* ]] && source="$dir/$source"
+    done
+    cd -P "$(dirname "$source")" && pwd
+}
+
+SCRIPT_DIR=$(get_script_dir)
+
+# Library directory can be overridden via environment variable (used by installer)
+LIB_DIR="${TOKEN_TRACKER_LIB_DIR:-${SCRIPT_DIR}/lib}"
+
+# ------------------------------------------------------------------------------
+# Source Library Modules
+# ------------------------------------------------------------------------------
+
+# shellcheck source=lib/utils.sh
+source "${LIB_DIR}/utils.sh"
+
+# shellcheck source=lib/config.sh
+source "${LIB_DIR}/config.sh"
+
+# shellcheck source=lib/parser.sh
+source "${LIB_DIR}/parser.sh"
+
+# shellcheck source=lib/display.sh
+source "${LIB_DIR}/display.sh"
+
+# ------------------------------------------------------------------------------
+# State
+# ------------------------------------------------------------------------------
+
+declare -g RUNNING=true
+declare -g FORCE_REFRESH=false
+declare -g SESSION_DIR=""
+declare -g LAST_REFRESH_TIME=0
+
+# ------------------------------------------------------------------------------
+# Signal Handlers
+# ------------------------------------------------------------------------------
+
+# Handle clean exit (SIGINT, SIGTERM)
+handle_exit() {
+    RUNNING=false
+    cleanup_display
+    echo ""
+    info_msg "Token tracker stopped."
+    exit 0
+}
+
+# Handle terminal resize (SIGWINCH)
+handle_resize_signal() {
+    handle_resize
+}
+
+# ------------------------------------------------------------------------------
+# Input Handling
+# ------------------------------------------------------------------------------
+
+# Process keyboard input (non-blocking)
+process_input() {
+    local key
+
+    # Read single character with timeout (non-blocking)
+    if read -rsn1 -t 0.1 key 2>/dev/null; then
+        case "$key" in
+            q|Q)
+                handle_exit
+                ;;
+            r|R)
+                FORCE_REFRESH=true
+                show_status "Refreshing..."
+                ;;
+            c|C)
+                reset_session_stats
+                show_status "Display cleared"
+                FORCE_REFRESH=true
+                ;;
+            *)
+                # Ignore other keys
+                ;;
+        esac
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Rate Limiting
+# ------------------------------------------------------------------------------
+
+# Check if enough time has passed since last refresh
+can_refresh() {
+    local now elapsed
+
+    now=$(now_seconds)
+    elapsed=$((now - LAST_REFRESH_TIME))
+
+    # Force refresh bypasses rate limit (but still respects minimum)
+    if [[ "$FORCE_REFRESH" == true ]]; then
+        [[ "$elapsed" -ge "$CONFIG_MIN_INTERVAL" ]] && return 0 || return 1
+    fi
+
+    # Normal refresh uses current interval (may be increased by adaptive backoff)
+    [[ "$elapsed" -ge "$CURRENT_INTERVAL" ]] && return 0 || return 1
+}
+
+# ------------------------------------------------------------------------------
+# Main Loop
+# ------------------------------------------------------------------------------
+
+main_loop() {
+    while [[ "$RUNNING" == true ]]; do
+        # Process any keyboard input
+        process_input
+
+        # Check if we should refresh
+        if can_refresh; then
+            # Parse session data
+            parse_session "$SESSION_DIR"
+
+            # Update display
+            refresh_display
+
+            # Update timing
+            LAST_REFRESH_TIME=$(now_seconds)
+            FORCE_REFRESH=false
+
+            # Clear status after successful refresh
+            clear_status
+        fi
+
+        # Small sleep to prevent CPU spinning
+        sleep 0.1
+    done
+}
+
+# ------------------------------------------------------------------------------
+# Initialization
+# ------------------------------------------------------------------------------
+
+init() {
+    # Check dependencies first
+    check_dependencies
+
+    # Parse command-line arguments
+    parse_args "$@"
+
+    # Validate configuration
+    validate_config
+
+    # Debug: show configuration
+    debug_msg "Configuration:"
+    debug_msg "  Refresh interval: ${CONFIG_REFRESH_INTERVAL}s"
+    debug_msg "  Token budget: ${CONFIG_TOKEN_BUDGET}"
+    debug_msg "  Global mode: ${CONFIG_GLOBAL_MODE}"
+    debug_msg "  Debug mode: ${CONFIG_DEBUG}"
+    debug_msg "  Input cost: \$${CONFIG_INPUT_COST}/1K"
+    debug_msg "  Output cost: \$${CONFIG_OUTPUT_COST}/1K"
+
+    # Check Claude data directory exists
+    local claude_dir
+    claude_dir=$(get_claude_data_dir)
+    debug_msg "Claude data directory: $claude_dir"
+    if [[ ! -d "$claude_dir" ]]; then
+        die "Claude Code data directory not found. Is Claude Code installed?" 1
+    fi
+
+    # Check permissions
+    if [[ ! -r "$claude_dir" ]]; then
+        die "Cannot read Claude data. Check permissions on ~/.claude/" 3
+    fi
+
+    # Find session directory
+    SESSION_DIR=$(get_session_directory)
+    debug_msg "Session directory: $SESSION_DIR"
+
+    # Initial parse
+    parse_session "$SESSION_DIR"
+    debug_msg "Initial tokens - Input: ${SESSION_INPUT_TOKENS}, Output: ${SESSION_OUTPUT_TOKENS}"
+    LAST_REFRESH_TIME=$(now_seconds)
+
+    # Set up signal handlers
+    trap handle_exit SIGINT SIGTERM
+    trap handle_resize_signal SIGWINCH
+
+    # Initialize display
+    init_display
+}
+
+# ------------------------------------------------------------------------------
+# Entry Point
+# ------------------------------------------------------------------------------
+
+main() {
+    # Initialize everything
+    init "$@"
+
+    # Run main loop
+    main_loop
+}
+
+# Run main function with all arguments
+main "$@"
